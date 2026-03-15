@@ -21,6 +21,9 @@ export const metadata: Metadata = {
   },
   manifest: '/site.webmanifest',
   themeColor: '#0a0a0f',
+  verification: {
+    google: 'uZEDr45Xj2856VxRRq3C06eidXK9cAi40w2iPgKVFmM',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
