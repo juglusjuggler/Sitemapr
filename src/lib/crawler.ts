@@ -361,6 +361,7 @@ export async function startCrawl(jobId: string) {
     job.progress.activeWorkers = activeWorkerCount;
     throttledEmitProgress();
 
+    let retried = false;
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), settings.requestTimeout);
@@ -437,31 +438,39 @@ export async function startCrawl(jobId: string) {
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Unknown error';
-      urlEntry.crawlStatus = 'failed';
-      urlEntry.error = message;
-      job.progress.failedUrls++;
 
       if (settings.retryFailed && urlEntry.retryCount < settings.maxRetries) {
         urlEntry.retryCount++;
         urlEntry.crawlStatus = 'queued';
         queue.push({ url: item.url, depth: item.depth });
-        job.progress.failedUrls--;
+        job.progress.totalQueued++; // re-add to queue count
+        // Don't count this attempt as processed — it will be retried
+        retried = true;
       } else {
+        urlEntry.crawlStatus = 'failed';
+        urlEntry.error = message;
+        job.progress.failedUrls++;
         addLog(job, 'error', `✗ Failed: ${item.url} — ${message}`);
       }
     } finally {
       activeWorkerCount--;
       job.progress.activeWorkers = activeWorkerCount;
-      job.progress.totalProcessed++;
-      job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
+      if (!retried) {
+        job.progress.totalProcessed++;
+        job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
+      }
       throttledEmitProgress();
     }
   }
 
   // --- Worker pool: each worker independently pulls from queue ---
-  async function worker(workerId: number): Promise<void> {
+  async function worker(): Promise<void> {
     let idleCount = 0;
-    const MAX_IDLE = 20; // Give up after 2s of empty queue (20 * 100ms)
+    // Workers exit after 500ms of empty queue when no other worker is active,
+    // or after 1.5s of empty queue regardless (to avoid zombie workers).
+    const IDLE_CHECK_MS = 50;
+    const MAX_IDLE_ALONE = 10;   // 10 * 50ms = 500ms if no other worker active
+    const MAX_IDLE_HARD = 30;    // 30 * 50ms = 1.5s absolute max idle
 
     while (!abortController.signal.aborted && getStatus() !== 'stopped') {
       // Paused — spin-wait
@@ -478,8 +487,11 @@ export async function startCrawl(jobId: string) {
       const item = queue.shift();
       if (!item) {
         idleCount++;
-        if (idleCount >= MAX_IDLE && activeWorkerCount === 0) break;
-        await sleep(100);
+        // Exit fast when queue is empty and nothing is being fetched
+        if (activeWorkerCount === 0 && idleCount >= MAX_IDLE_ALONE) break;
+        // Hard exit to prevent zombie workers
+        if (idleCount >= MAX_IDLE_HARD) break;
+        await sleep(IDLE_CHECK_MS);
         continue;
       }
 
@@ -506,7 +518,7 @@ export async function startCrawl(jobId: string) {
       }
     }, 250);
 
-    const workers = Array.from({ length: workerCount }, (_, i) => worker(i));
+    const workers = Array.from({ length: workerCount }, () => worker());
     await Promise.all(workers);
 
     clearInterval(progressTicker);
@@ -541,7 +553,13 @@ function updateProgressStats(job: CrawlJob) {
 
   const total = progress.totalDiscovered;
   if (total > 0) {
-    progress.progressPercent = Math.min(100, Math.round((progress.totalProcessed / total) * 100));
+    const rawPercent = Math.round((progress.totalProcessed / total) * 100);
+    // Only show 100% when crawl is actually finished, cap at 99% while running
+    if (progress.status === 'running' || progress.status === 'paused') {
+      progress.progressPercent = Math.min(99, rawPercent);
+    } else {
+      progress.progressPercent = Math.min(100, rawPercent);
+    }
   }
 
   if (progress.pagesPerSecond > 0 && progress.totalQueued > 0) {
