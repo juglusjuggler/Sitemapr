@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#0a0a0f"/>
+  <circle cx="256" cy="256" r="140" fill="none" stroke="#06b6d4" stroke-width="24" opacity="0.3"/>
+  <circle cx="256" cy="256" r="90" fill="none" stroke="#06b6d4" stroke-width="20" opacity="0.5"/>
+  <circle cx="256" cy="256" r="40" fill="none" stroke="#06b6d4" stroke-width="16" opacity="0.8"/>
+  <circle cx="256" cy="256" r="12" fill="#06b6d4"/>
+  <line x1="256" y1="116" x2="256" y2="76" stroke="#22d3ee" stroke-width="14" stroke-linecap="round"/>
+  <line x1="256" y1="436" x2="256" y2="396" stroke="#22d3ee" stroke-width="14" stroke-linecap="round"/>
+  <line x1="116" y1="256" x2="76" y2="256" stroke="#22d3ee" stroke-width="14" stroke-linecap="round"/>
+  <line x1="436" y1="256" x2="396" y2="256" stroke="#22d3ee" stroke-width="14" stroke-linecap="round"/>
+  <line x1="157" y1="157" x2="129" y2="129" stroke="#22d3ee" stroke-width="12" stroke-linecap="round" opacity="0.6"/>
+  <line x1="355" y1="157" x2="383" y2="129" stroke="#22d3ee" stroke-width="12" stroke-linecap="round" opacity="0.6"/>
+  <line x1="157" y1="355" x2="129" y2="383" stroke="#22d3ee" stroke-width="12" stroke-linecap="round" opacity="0.6"/>
+  <line x1="355" y1="355" x2="383" y2="383" stroke="#22d3ee" stroke-width="12" stroke-linecap="round" opacity="0.6"/>
+</svg>
