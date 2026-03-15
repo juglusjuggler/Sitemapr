@@ -9,6 +9,36 @@ const jobs = new Map<string, CrawlJob>();
 const jobAbortControllers = new Map<string, AbortController>();
 const sseListeners = new Map<string, Set<SSECallback>>();
 
+// --- Fast regex-based link extractor (avoids full DOM parse for link discovery) ---
+const HREF_RE = /<a\s[^>]*?href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/gi;
+const TITLE_RE = /<title[^>]*>([\s\S]*?)<\/title>/i;
+const CANONICAL_RE = /<link[^>]*rel\s*=\s*["']canonical["'][^>]*href\s*=\s*["']([^"']*)["'][^>]*>/i;
+const CANONICAL_RE2 = /<link[^>]*href\s*=\s*["']([^"']*)["'][^>]*rel\s*=\s*["']canonical["'][^>]*>/i;
+
+function extractLinksRegex(html: string): string[] {
+  const links: string[] = [];
+  let match;
+  HREF_RE.lastIndex = 0;
+  while ((match = HREF_RE.exec(html)) !== null) {
+    const href = match[1] || match[2] || match[3];
+    if (href) links.push(href);
+  }
+  return links;
+}
+
+function extractTitleRegex(html: string): string {
+  const match = TITLE_RE.exec(html);
+  if (match) {
+    return match[1].replace(/\s+/g, ' ').trim().slice(0, 200);
+  }
+  return '';
+}
+
+function extractCanonicalRegex(html: string): string {
+  const match = CANONICAL_RE.exec(html) || CANONICAL_RE2.exec(html);
+  return match ? match[1] : '';
+}
+
 export function getJob(id: string): CrawlJob | undefined {
   return jobs.get(id);
 }
@@ -43,7 +73,7 @@ export function addSSEListener(jobId: string, cb: SSECallback): () => void {
 function addLog(job: CrawlJob, level: LogEntry['level'], message: string) {
   const entry: LogEntry = { timestamp: new Date().toISOString(), level, message };
   job.logs.push(entry);
-  if (job.logs.length > 2000) job.logs = job.logs.slice(-1500);
+  if (job.logs.length > 5000) job.logs = job.logs.slice(-4000);
   emitSSE(job.id, 'log', entry);
 }
 
@@ -149,12 +179,32 @@ export async function startCrawl(jobId: string) {
 
   job.progress.status = 'running';
   job.progress.startedAt = new Date().toISOString();
-  addLog(job, 'success', `▶ Crawl started: ${job.targetUrl}`);
+  addLog(job, 'success', `▶ Crawl started: ${job.targetUrl} (${job.settings.maxConcurrency} workers)`);
   emitProgress(job);
 
   const { settings } = job;
   const queue: { url: string; depth: number }[] = [];
+  let activeWorkerCount = 0;
   let robotsRules: { path: string; allow: boolean }[] = [];
+
+  // Determine parse mode: use fast regex for high concurrency, cheerio for low
+  const useFastParser = settings.maxConcurrency > 5;
+
+  // Throttled SSE progress — emit at most every 100ms to avoid flooding
+  let lastProgressEmit = 0;
+  const PROGRESS_INTERVAL = 100;
+  function throttledEmitProgress() {
+    const now = Date.now();
+    if (now - lastProgressEmit >= PROGRESS_INTERVAL) {
+      lastProgressEmit = now;
+      updateProgressStats(job);
+      emitProgress(job);
+    }
+  }
+
+  // Throttled logging — at high concurrency, only log every Nth success
+  let successCount = 0;
+  const LOG_EVERY = settings.maxConcurrency > 20 ? 50 : settings.maxConcurrency > 5 ? 10 : 1;
 
   // Fetch robots.txt
   if (settings.obeyRobotsTxt) {
@@ -217,13 +267,57 @@ export async function startCrawl(jobId: string) {
 
   const getStatus = () => job.progress.status as CrawlStatus;
 
-  // Worker function
+  // --- Resolve a discovered href into a canonical URL or null ---
+  function resolveHref(href: string, baseUrl: string): string | null {
+    let resolved = normalizeUrl(href, baseUrl);
+    if (!resolved) return null;
+    if (settings.ignoreQueryParams) {
+      resolved = stripTrackingParams(resolved);
+      try {
+        const u = new URL(resolved);
+        u.search = '';
+        resolved = u.toString();
+      } catch { /* keep */ }
+    } else {
+      resolved = stripTrackingParams(resolved);
+    }
+    if (!isValidCrawlUrl(resolved)) return null;
+    if (!isSameDomain(resolved, job.domain, settings.includeSubdomains)) return null;
+    return resolved;
+  }
+
+  // --- Add a newly discovered URL to the queue ---
+  function enqueueUrl(resolved: string, depth: number) {
+    if (job.urls.has(resolved)) return;
+    if (job.progress.totalDiscovered >= settings.maxPages) return;
+    const newEntry: DiscoveredUrl = {
+      url: resolved,
+      statusCode: null,
+      title: '',
+      depth,
+      discoveredAt: new Date().toISOString(),
+      scannedAt: null,
+      contentType: '',
+      canonical: '',
+      crawlStatus: 'queued',
+      retryCount: 0,
+    };
+    job.urls.set(resolved, newEntry);
+    queue.push({ url: resolved, depth });
+    job.progress.totalDiscovered++;
+    job.progress.totalQueued++;
+    if (depth > job.progress.currentDepth) {
+      job.progress.currentDepth = depth;
+    }
+  }
+
+  // --- Process a single URL (called by workers) ---
   async function processUrl(item: { url: string; depth: number }): Promise<void> {
     if (abortController.signal.aborted) return;
 
     // Wait while paused
     while (getStatus() === 'paused') {
-      await sleep(500);
+      await sleep(200);
       if (abortController.signal.aborted) return;
     }
 
@@ -238,10 +332,9 @@ export async function startCrawl(jobId: string) {
         const pathname = new URL(item.url).pathname;
         if (!isAllowedByRobots(pathname, robotsRules)) {
           urlEntry.crawlStatus = 'skipped';
-          addLog(job, 'warn', `⊘ Blocked by robots.txt: ${item.url}`);
           job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
           job.progress.totalProcessed++;
-          emitProgress(job);
+          throttledEmitProgress();
           return;
         }
       } catch { /* proceed */ }
@@ -252,31 +345,32 @@ export async function startCrawl(jobId: string) {
       urlEntry.crawlStatus = 'skipped';
       job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
       job.progress.totalProcessed++;
-      emitProgress(job);
+      throttledEmitProgress();
       return;
     }
     if (excludePatterns.length > 0 && matchesPatterns(item.url, excludePatterns)) {
       urlEntry.crawlStatus = 'skipped';
-      addLog(job, 'info', `⊘ Excluded by pattern: ${item.url}`);
       job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
       job.progress.totalProcessed++;
-      emitProgress(job);
+      throttledEmitProgress();
       return;
     }
 
     urlEntry.crawlStatus = 'fetching';
-    job.progress.activeWorkers++;
-    addLog(job, 'info', `→ Fetching: ${item.url}`);
-    emitProgress(job);
+    activeWorkerCount++;
+    job.progress.activeWorkers = activeWorkerCount;
+    throttledEmitProgress();
 
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), settings.requestTimeout);
-      
+
       const response = await fetch(item.url, {
         headers: {
           'User-Agent': settings.userAgent,
           'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Encoding': 'gzip, deflate',
+          'Connection': 'keep-alive',
         },
         redirect: settings.followRedirects ? 'follow' : 'manual',
         signal: controller.signal,
@@ -289,72 +383,52 @@ export async function startCrawl(jobId: string) {
 
       if (response.ok && urlEntry.contentType.includes('text/html')) {
         const html = await response.text();
-        const $ = cheerio.load(html);
 
-        // Extract title
-        urlEntry.title = $('title').first().text().trim().slice(0, 200);
-
-        // Extract canonical
-        const canonical = $('link[rel="canonical"]').attr('href');
-        if (canonical) {
-          urlEntry.canonical = normalizeUrl(canonical, item.url) || '';
-        }
-
-        // Extract links
-        if (item.depth < settings.maxDepth) {
-          $('a[href]').each((_, el) => {
-            if (abortController.signal.aborted) return;
-            if (job.progress.totalDiscovered >= settings.maxPages) return;
-
-            const href = $(el).attr('href');
-            if (!href) return;
-
-            let resolved = normalizeUrl(href, item.url);
-            if (!resolved) return;
-
-            if (settings.ignoreQueryParams) {
-              resolved = stripTrackingParams(resolved);
-              try {
-                const u = new URL(resolved);
-                u.search = '';
-                resolved = u.toString();
-              } catch { /* keep as is */ }
-            } else {
-              resolved = stripTrackingParams(resolved);
+        if (useFastParser) {
+          // Fast regex-based extraction — avoids full DOM parse overhead
+          urlEntry.title = extractTitleRegex(html);
+          const rawCanonical = extractCanonicalRegex(html);
+          if (rawCanonical) {
+            urlEntry.canonical = normalizeUrl(rawCanonical, item.url) || '';
+          }
+          if (item.depth < settings.maxDepth) {
+            const hrefs = extractLinksRegex(html);
+            for (const href of hrefs) {
+              if (abortController.signal.aborted) break;
+              if (job.progress.totalDiscovered >= settings.maxPages) break;
+              const resolved = resolveHref(href, item.url);
+              if (resolved) enqueueUrl(resolved, item.depth + 1);
             }
-
-            if (!isValidCrawlUrl(resolved)) return;
-            if (!isSameDomain(resolved, job.domain, settings.includeSubdomains)) return;
-            if (job.urls.has(resolved)) return;
-
-            const newEntry: DiscoveredUrl = {
-              url: resolved,
-              statusCode: null,
-              title: '',
-              depth: item.depth + 1,
-              discoveredAt: new Date().toISOString(),
-              scannedAt: null,
-              contentType: '',
-              canonical: '',
-              crawlStatus: 'queued',
-              retryCount: 0,
-            };
-            job.urls.set(resolved, newEntry);
-            queue.push({ url: resolved, depth: item.depth + 1 });
-            job.progress.totalDiscovered++;
-            job.progress.totalQueued++;
-
-            if (item.depth + 1 > job.progress.currentDepth) {
-              job.progress.currentDepth = item.depth + 1;
-            }
-          });
+          }
+        } else {
+          // Full cheerio parse for accuracy at low concurrency
+          const $ = cheerio.load(html);
+          urlEntry.title = $('title').first().text().trim().slice(0, 200);
+          const canonical = $('link[rel="canonical"]').attr('href');
+          if (canonical) {
+            urlEntry.canonical = normalizeUrl(canonical, item.url) || '';
+          }
+          if (item.depth < settings.maxDepth) {
+            $('a[href]').each((_, el) => {
+              if (abortController.signal.aborted) return;
+              if (job.progress.totalDiscovered >= settings.maxPages) return;
+              const href = $(el).attr('href');
+              if (!href) return;
+              const resolved = resolveHref(href, item.url);
+              if (resolved) enqueueUrl(resolved, item.depth + 1);
+            });
+          }
         }
 
         urlEntry.crawlStatus = 'success';
-        addLog(job, 'success', `✓ [${response.status}] ${item.url}${urlEntry.title ? ` — "${urlEntry.title}"` : ''}`);
+        successCount++;
+        if (successCount % LOG_EVERY === 0 || successCount <= 5) {
+          addLog(job, 'success', `✓ [${response.status}] ${item.url}${urlEntry.title ? ` — "${urlEntry.title}"` : ''} (${successCount} done)`);
+        }
       } else if (response.ok) {
         urlEntry.crawlStatus = 'success';
-        addLog(job, 'info', `✓ [${response.status}] Non-HTML: ${item.url}`);
+        successCount++;
+        // Don't consume body for non-HTML to save time
       } else {
         urlEntry.crawlStatus = 'failed';
         urlEntry.error = `HTTP ${response.status}`;
@@ -372,47 +446,70 @@ export async function startCrawl(jobId: string) {
         urlEntry.crawlStatus = 'queued';
         queue.push({ url: item.url, depth: item.depth });
         job.progress.failedUrls--;
-        addLog(job, 'warn', `↻ Retry ${urlEntry.retryCount}/${settings.maxRetries}: ${item.url} (${message})`);
       } else {
         addLog(job, 'error', `✗ Failed: ${item.url} — ${message}`);
       }
     } finally {
-      job.progress.activeWorkers = Math.max(0, job.progress.activeWorkers - 1);
+      activeWorkerCount--;
+      job.progress.activeWorkers = activeWorkerCount;
       job.progress.totalProcessed++;
       job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
-      updateProgressStats(job);
-      emitProgress(job);
+      throttledEmitProgress();
     }
   }
 
-  // Main crawl loop
-  try {
-    while (queue.length > 0 && !abortController.signal.aborted && getStatus() !== 'stopped') {
+  // --- Worker pool: each worker independently pulls from queue ---
+  async function worker(workerId: number): Promise<void> {
+    let idleCount = 0;
+    const MAX_IDLE = 20; // Give up after 2s of empty queue (20 * 100ms)
+
+    while (!abortController.signal.aborted && getStatus() !== 'stopped') {
+      // Paused — spin-wait
       if (getStatus() === 'paused') {
-        await sleep(500);
+        await sleep(200);
+        idleCount = 0;
         continue;
       }
 
-      if (job.progress.totalProcessed >= settings.maxPages) {
-        addLog(job, 'warn', `Max pages limit reached (${settings.maxPages})`);
-        break;
+      // Max pages reached
+      if (job.progress.totalProcessed >= settings.maxPages) break;
+
+      // Pull from queue
+      const item = queue.shift();
+      if (!item) {
+        idleCount++;
+        if (idleCount >= MAX_IDLE && activeWorkerCount === 0) break;
+        await sleep(100);
+        continue;
       }
 
-      const batch: { url: string; depth: number }[] = [];
-      const batchSize = Math.min(settings.maxConcurrency, queue.length);
-      for (let i = 0; i < batchSize; i++) {
-        const item = queue.shift();
-        if (item) batch.push(item);
-      }
+      idleCount = 0;
+      await processUrl(item);
 
-      if (batch.length === 0) break;
-
-      await Promise.all(batch.map((item) => processUrl(item)));
-
+      // Per-worker crawl delay (not per-batch!) to spread load
       if (settings.crawlDelay > 0) {
         await sleep(settings.crawlDelay);
       }
     }
+  }
+
+  // Launch workers
+  try {
+    const workerCount = Math.min(settings.maxConcurrency, 200);
+    addLog(job, 'info', `Launching ${workerCount} concurrent workers...`);
+
+    // Start a progress ticker for consistent UI updates
+    const progressTicker = setInterval(() => {
+      if (getStatus() === 'running' || getStatus() === 'paused') {
+        updateProgressStats(job);
+        emitProgress(job);
+      }
+    }, 250);
+
+    const workers = Array.from({ length: workerCount }, (_, i) => worker(i));
+    await Promise.all(workers);
+
+    clearInterval(progressTicker);
   } catch (err) {
     if (!abortController.signal.aborted) {
       const message = err instanceof Error ? err.message : 'Unknown error';
@@ -423,7 +520,7 @@ export async function startCrawl(jobId: string) {
 
   if (job.progress.status === 'running') {
     job.progress.status = 'completed';
-    addLog(job, 'success', `■ Crawl completed. ${job.progress.totalProcessed} pages processed, ${job.progress.totalDiscovered} URLs discovered.`);
+    addLog(job, 'success', `■ Crawl completed. ${job.progress.totalProcessed} pages processed, ${job.progress.totalDiscovered} URLs discovered. ${job.progress.pagesPerSecond} pages/sec.`);
   }
 
   job.progress.activeWorkers = 0;

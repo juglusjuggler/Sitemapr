@@ -41,7 +41,7 @@ export function SettingsPanel({ settings, onChange, disabled }: SettingsPanelPro
               <div className="mt-3 flex items-start gap-2 p-3 rounded-lg bg-amber-500/5 border border-amber-500/20">
                 <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                 <p className="text-[11px] text-amber-300/80 leading-relaxed">
-                  Higher concurrency speeds up crawling but increases load on the target server. Use conservative settings for production sites.
+                  Recommended: 50–100 workers with 0ms delay for max speed. Use lower settings for production sites to be polite.
                 </p>
               </div>
 
@@ -51,8 +51,8 @@ export function SettingsPanel({ settings, onChange, disabled }: SettingsPanelPro
                   label="Max Concurrency"
                   value={settings.maxConcurrency}
                   onChange={(v) => onChange({ maxConcurrency: v })}
-                  min={1} max={10} disabled={disabled}
-                  hint="Number of concurrent workers (1–10)"
+                  min={1} max={200} disabled={disabled}
+                  hint="Concurrent workers (1–200). Higher = faster."
                 />
                 <NumberInput
                   label="Crawl Delay (ms)"
@@ -65,8 +65,8 @@ export function SettingsPanel({ settings, onChange, disabled }: SettingsPanelPro
                   label="Request Timeout (ms)"
                   value={settings.requestTimeout}
                   onChange={(v) => onChange({ requestTimeout: v })}
-                  min={1000} max={30000} step={1000} disabled={disabled}
-                  hint="Timeout per individual request"
+                  min={1000} max={30000} step={500} disabled={disabled}
+                  hint="Timeout per request (lower = faster)"
                 />
               </Section>
 
@@ -76,15 +76,15 @@ export function SettingsPanel({ settings, onChange, disabled }: SettingsPanelPro
                   label="Max Depth"
                   value={settings.maxDepth}
                   onChange={(v) => onChange({ maxDepth: v })}
-                  min={1} max={50} disabled={disabled}
+                  min={1} max={100} disabled={disabled}
                   hint="Maximum link depth to follow"
                 />
                 <NumberInput
                   label="Max Pages"
                   value={settings.maxPages}
                   onChange={(v) => onChange({ maxPages: v })}
-                  min={1} max={5000} step={10} disabled={disabled}
-                  hint="Maximum total pages to crawl"
+                  min={1} max={100000} step={100} disabled={disabled}
+                  hint="Maximum total pages (up to 100k)"
                 />
               </Section>
 
