@@ -22,6 +22,7 @@ export function stripTrackingParams(url: string): string {
     const trackingParams = [
       'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
       'fbclid', 'gclid', 'msclkid', 'ref', 'mc_cid', 'mc_eid',
+      'tmstv', 'timestamp', '_t', 'cb', 'nocache',
     ];
     trackingParams.forEach((p) => parsed.searchParams.delete(p));
     return parsed.toString();
@@ -47,7 +48,11 @@ export function isValidCrawlUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-    const ext = parsed.pathname.split('.').pop()?.toLowerCase() || '';
+    // Skip common download/file/asset paths
+    const pathname = parsed.pathname.toLowerCase();
+    const skipPathSegments = ['/download/', '/downloads/', '/attachment/', '/attachments/', '/wp-content/uploads/'];
+    if (skipPathSegments.some((seg) => pathname.includes(seg))) return false;
+    const ext = pathname.split('.').pop() || '';
     const skipExtensions = [
       'jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'ico', 'bmp', 'tiff',
       'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',

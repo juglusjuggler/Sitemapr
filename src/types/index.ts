@@ -77,8 +77,8 @@ export interface CrawlJobSummary {
 }
 
 export const DEFAULT_SETTINGS: CrawlSettings = {
-  maxConcurrency: 50,
-  requestTimeout: 8000,
+  maxConcurrency: 20,
+  requestTimeout: 10000,
   maxDepth: 20,
   maxPages: 10000,
   crawlDelay: 0,

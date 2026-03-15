@@ -187,6 +187,13 @@ export async function startCrawl(jobId: string) {
   let activeWorkerCount = 0;
   let robotsRules: { path: string; allow: boolean }[] = [];
 
+  // Adaptive concurrency: reduce workers when failure rate spikes
+  let effectiveConcurrency = settings.maxConcurrency;
+  let recentFailures = 0;
+  let recentRequests = 0;
+  const FAILURE_CHECK_WINDOW = 20;
+  const FAILURE_RATE_THRESHOLD = 0.5; // back off if >50% of recent requests fail
+
   // Determine parse mode: use fast regex for high concurrency, cheerio for low
   const useFastParser = settings.maxConcurrency > 5;
 
@@ -332,7 +339,7 @@ export async function startCrawl(jobId: string) {
         const pathname = new URL(item.url).pathname;
         if (!isAllowedByRobots(pathname, robotsRules)) {
           urlEntry.crawlStatus = 'skipped';
-          job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
+          job.progress.totalQueued = queue.length;
           job.progress.totalProcessed++;
           throttledEmitProgress();
           return;
@@ -343,14 +350,14 @@ export async function startCrawl(jobId: string) {
     // Check include/exclude patterns
     if (includePatterns.length > 0 && !matchesPatterns(item.url, includePatterns)) {
       urlEntry.crawlStatus = 'skipped';
-      job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
+      job.progress.totalQueued = queue.length;
       job.progress.totalProcessed++;
       throttledEmitProgress();
       return;
     }
     if (excludePatterns.length > 0 && matchesPatterns(item.url, excludePatterns)) {
       urlEntry.crawlStatus = 'skipped';
-      job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
+      job.progress.totalQueued = queue.length;
       job.progress.totalProcessed++;
       throttledEmitProgress();
       return;
@@ -423,6 +430,12 @@ export async function startCrawl(jobId: string) {
 
         urlEntry.crawlStatus = 'success';
         successCount++;
+        // Track success for adaptive concurrency
+        recentRequests++;
+        if (recentRequests >= FAILURE_CHECK_WINDOW) {
+          recentFailures = 0;
+          recentRequests = 0;
+        }
         if (successCount % LOG_EVERY === 0 || successCount <= 5) {
           addLog(job, 'success', `✓ [${response.status}] ${item.url}${urlEntry.title ? ` — "${urlEntry.title}"` : ''} (${successCount} done)`);
         }
@@ -439,11 +452,26 @@ export async function startCrawl(jobId: string) {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Unknown error';
 
+      // Track failure rate for adaptive concurrency
+      recentRequests++;
+      recentFailures++;
+      if (recentRequests >= FAILURE_CHECK_WINDOW) {
+        const failureRate = recentFailures / recentRequests;
+        if (failureRate >= FAILURE_RATE_THRESHOLD && effectiveConcurrency > 3) {
+          const newConcurrency = Math.max(3, Math.floor(effectiveConcurrency / 2));
+          if (newConcurrency < effectiveConcurrency) {
+            addLog(job, 'warn', `⚡ High failure rate (${Math.round(failureRate * 100)}%), reducing concurrency: ${effectiveConcurrency} → ${newConcurrency}`);
+            effectiveConcurrency = newConcurrency;
+          }
+        }
+        recentFailures = 0;
+        recentRequests = 0;
+      }
+
       if (settings.retryFailed && urlEntry.retryCount < settings.maxRetries) {
         urlEntry.retryCount++;
         urlEntry.crawlStatus = 'queued';
         queue.push({ url: item.url, depth: item.depth });
-        job.progress.totalQueued++; // re-add to queue count
         // Don't count this attempt as processed — it will be retried
         retried = true;
       } else {
@@ -457,8 +485,9 @@ export async function startCrawl(jobId: string) {
       job.progress.activeWorkers = activeWorkerCount;
       if (!retried) {
         job.progress.totalProcessed++;
-        job.progress.totalQueued = Math.max(0, job.progress.totalQueued - 1);
       }
+      // Recalculate totalQueued from actual queue length to prevent drift
+      job.progress.totalQueued = queue.length;
       throttledEmitProgress();
     }
   }
@@ -482,6 +511,12 @@ export async function startCrawl(jobId: string) {
 
       // Max pages reached
       if (job.progress.totalProcessed >= settings.maxPages) break;
+
+      // Adaptive concurrency: pause this worker if we have too many active
+      if (activeWorkerCount >= effectiveConcurrency) {
+        await sleep(100);
+        continue;
+      }
 
       // Pull from queue
       const item = queue.shift();
